@@ -1,0 +1,613 @@
+import joblib
+
+import pandas as pd
+
+import numpy as np
+
+import requests
+
+import random
+
+import difflib
+
+import psycopg2
+
+from datetime import datetime, timedelta, timezone
+
+
+
+# ==========================================
+
+# 1. CONFIGURATION
+
+# ==========================================
+
+ODDS_API_KEY = "01d8be5a8046e9fd1b16a19c5f5823ae"
+
+SPORT_KEY = "basketball_ncaab"
+
+# YOUR NEON DB CONNECTION
+
+DB_URL = "postgresql://neondb_owner:npg_fx3jXEOrYd4a@ep-jolly-sunset-a4ktuss0-pooler.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
+
+
+
+# Standardizing Team Names
+
+MANUAL_MAP = {
+
+    "Ole Miss Rebels": "Mississippi", "UConn Huskies": "Connecticut", "UConn": "Connecticut",
+
+    "NC State Wolfpack": "N.C. State", "UMass Minutemen": "Massachusetts",
+
+    "Miami (FL) Hurricanes": "Miami FL", "Penn State Nittany Lions": "Penn St.",
+
+    "Ohio State Buckeyes": "Ohio St.", "Michigan State Spartans": "Michigan St.",
+
+    "Mississippi State Bulldogs": "Mississippi St.", "Kansas State Wildcats": "Kansas St.",
+
+    "Florida State Seminoles": "Florida St.", "Iowa State Cyclones": "Iowa St.",
+
+    "Oklahoma State Cowboys": "Oklahoma St.", "Washington State Cougars": "Washington St.",
+
+    "Oregon State Beavers": "Oregon St.", "Arizona State Sun Devils": "Arizona St.",
+
+    "Saint Mary's Gaels": "Saint Mary's", "St. John's Red Storm": "St. John's",
+
+    "Loyola Chicago Ramblers": "Loyola Chicago", "VCU Rams": "VCU",
+
+    "BYU Cougars": "BYU", "SMU Mustangs": "SMU", "TCU Horned Frogs": "TCU",
+
+    "UAB Blazers": "UAB", "UCF Knights": "UCF", "USC Trojans": "USC",
+
+    "UNLV Rebels": "UNLV", "UTEP Miners": "UTEP", "UTSA Roadrunners": "UTSA",
+
+    "VMI Keydets": "VMI", "LSU Tigers": "LSU",
+
+    "Duke Blue Devils": "Duke", "Alabama Crimson Tide": "Alabama",
+
+    "Michigan Wolverines": "Michigan", "Gonzaga Bulldogs": "Gonzaga",
+
+    "Texas Tech Red Raiders": "Texas Tech", "Florida Gators": "Florida",
+
+    "Wisconsin Badgers": "Wisconsin", "Saint Louis Billikens": "Saint Louis",
+
+    "Arkansas Razorbacks": "Arkansas", "Auburn Tigers": "Auburn",
+
+    "South Carolina Gamecocks": "South Carolina", "Virginia Cavaliers": "Virginia",
+
+    "Syracuse Orange": "Syracuse", "Iowa Hawkeyes": "Iowa",
+
+    "Nebraska Cornhuskers": "Nebraska", "Virginia Tech Hokies": "Virginia Tech",
+
+    "Colorado Buffaloes": "Colorado", "Georgia Bulldogs": "Georgia",
+
+    "Santa Clara Broncos": "Santa Clara", "Northwestern Wildcats": "Northwestern",
+
+    "Butler Bulldogs": "Butler"
+
+}
+
+
+
+# --- HELPER 1: GET LIVE ODDS (Future Games) ---
+
+def get_live_odds():
+
+    url = f'https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/odds'
+
+    now = datetime.now(timezone.utc)
+
+    params = {
+
+        'api_key': ODDS_API_KEY, 
+
+        'regions': 'us', 
+
+        'markets': 'spreads,totals', 
+
+        'oddsFormat': 'american', 
+
+        'bookmakers': 'betmgm,draftkings,fanduel',
+
+        'commenceTimeFrom': now.strftime('%Y-%m-%dT%H:%M:%SZ'),
+
+        'commenceTimeTo': (now + timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+    }
+
+    try:
+
+        res = requests.get(url, params=params).json()
+
+        matchups = []
+
+        for game in res:
+
+            start_time_dt = datetime.strptime(game['commence_time'], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+
+            if start_time_dt < now: continue 
+
+
+
+            h, a = game['home_team'], game['away_team']
+
+            spread, total = 0.0, 145.0 
+
+            books = sorted(game.get('bookmakers', []), key=lambda x: 0 if x['key'] == 'betmgm' else (1 if x['key'] == 'draftkings' else 2))
+
+            for bk in books:
+
+                s_found, t_found = None, None
+
+                for m in bk['markets']:
+
+                    if m['key'] == 'spreads':
+
+                        for o in m['outcomes']:
+
+                            if o['name'] == game['home_team']: s_found = o['point']
+
+                    if m['key'] == 'totals': t_found = m['outcomes'][0]['point']
+
+                if s_found is not None: spread = s_found
+
+                if t_found is not None: total = t_found
+
+                if s_found is not None: break
+
+            
+
+            matchups.append({
+
+                'home': h, 'away': a, 
+
+                'spread': float(spread) if spread is not None else 0.0, 
+
+                'total': float(total) if total is not None else 145.0, 
+
+                'start_time': start_time_dt 
+
+            })
+
+        return matchups
+
+    except Exception as e:
+
+        print(f"API ERROR OR PARSING FAILURE: {e}")
+
+        return []
+
+
+
+# --- HELPER 2: GET FINAL SCORES (Finished Games) ---
+
+def update_final_scores():
+
+    print("\n--- CHECKING FOR COMPLETED GAMES (LAST 24 HOURS) ---")
+
+    url = f'https://api.the-odds-api.com/v4/sports/{SPORT_KEY}/scores'
+
+    params = {
+
+        'api_key': ODDS_API_KEY,
+
+        'daysFrom': 1
+
+    }
+
+    
+
+    try:
+
+        res = requests.get(url, params=params).json()
+
+        updates = []
+
+        
+
+        for game in res:
+
+            if not game.get('completed', False): continue
+
+            scores = game.get('scores', [])
+
+            if not scores: continue
+
+            
+
+            h_score, a_score = 0, 0
+
+            for s in scores:
+
+                if s['name'] == game['home_team']: h_score = int(s['score'])
+
+                if s['name'] == game['away_team']: a_score = int(s['score'])
+
+
+
+            date_str = game['commence_time'][:10]
+
+            game_id = f"{date_str}_NCAAB_{game['away_team']}_{game['home_team']}".replace(" ", "").replace(".","")
+
+            updates.append((h_score, a_score, game_id))
+
+            
+
+        if updates:
+
+            conn = psycopg2.connect(DB_URL)
+
+            cur = conn.cursor()
+
+            sql = """
+
+            UPDATE "predictions_2.0"
+
+            SET home_score = %s, away_score = %s, updated_at = CURRENT_TIMESTAMP
+
+            WHERE game_id = %s;
+
+            """
+
+            cur.executemany(sql, updates)
+
+            conn.commit()
+
+            cur.close()
+
+            conn.close()
+
+            print(f"   > SUCCESS: Updated final scores for {len(updates)} games.")
+
+        else:
+
+            print("   > No new completed games found to update.")
+
+            
+
+    except Exception as e:
+
+        print(f"   > Score Update Error: {e}")
+
+
+
+def load_brains():
+
+    try:
+
+        return joblib.load('ncaa_model_spread.pkl'), joblib.load('ncaa_model_total.pkl'), \
+
+               joblib.load('ncaa_elo_state.pkl'), pd.read_csv('ncaa_unit_stats.csv'), \
+
+               joblib.load('ncaa_features.pkl')
+
+    except: return None
+
+
+
+def run_monte_carlo(h_proj, a_proj, h_std, a_std, iterations=5000):
+
+    sim_margins = []
+
+    for _ in range(iterations):
+
+        sim_margins.append(random.gauss(h_proj, h_std) - random.gauss(a_proj, a_std))
+
+    return sum(sim_margins) / iterations
+
+
+
+def match_team(api_name, db_teams):
+
+    if api_name in MANUAL_MAP: return MANUAL_MAP[api_name]
+
+    if api_name in db_teams: return api_name
+
+    match = difflib.get_close_matches(api_name, db_teams, n=1, cutoff=0.25)
+
+    return match[0] if match else None
+
+
+
+def explain_pick(row, home, away, h_u, a_u):
+
+    reasons = []
+
+    elo_diff = row['elo_diff'].values[0]
+
+    if elo_diff > 100: reasons.append(f"{home} Elo Adv")
+
+    elif elo_diff < -100: reasons.append(f"{away} Elo Adv")
+
+    if h_u['3P_pct'] > 38.0 and a_u['Def_3P_pct'] > 35.0: reasons.append(f"{home} 3PT Mismatch")
+
+    elif a_u['3P_pct'] > 38.0 and h_u['Def_3P_pct'] > 35.0: reasons.append(f"{away} 3PT Mismatch")
+
+    if h_u['Def_TOV_pct'] > 22.0 and a_u['TOV_pct'] > 20.0: reasons.append(f"{home} Press Adv")
+
+    elif a_u['Def_TOV_pct'] > 22.0 and h_u['TOV_pct'] > 20.0: reasons.append(f"{away} Press Adv")
+
+    if h_u['ORB_rate'] > 35.0 and a_u['DRB_rate'] < 70.0: reasons.append(f"{home} Glass Edge")
+
+    return "; ".join(reasons) if reasons else "Stats Edge"
+
+
+
+def save_to_db(data):
+
+    try:
+
+        conn = psycopg2.connect(DB_URL)
+
+        cur = conn.cursor()
+
+        sql = """
+
+        INSERT INTO "predictions_2.0" (
+
+            game_id, league, sport_id, date, home_team, away_team, 
+
+            home_score, away_score, predicted_winner, predicted_total, 
+
+            predicted_spread, consensus_spread, spread, total, confidence, updated_at
+
+        )
+
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+
+        ON CONFLICT (game_id) 
+
+        DO UPDATE SET 
+
+            predicted_winner = EXCLUDED.predicted_winner,
+
+            predicted_total = EXCLUDED.predicted_total,
+
+            predicted_spread = EXCLUDED.predicted_spread,
+
+            consensus_spread = EXCLUDED.consensus_spread,
+
+            spread = EXCLUDED.spread,
+
+            total = EXCLUDED.total,
+
+            confidence = EXCLUDED.confidence,
+
+            updated_at = CURRENT_TIMESTAMP;
+
+        """
+
+        cur.executemany(sql, data)
+
+        conn.commit()
+
+        cur.close()
+
+        conn.close()
+
+        print(f"   > Successfully upserted {len(data)} NCAAB records into predictions_2.0.")
+
+    except Exception as e:
+
+        print(f"   > Database Error: {e}")
+
+
+
+def run_consensus():
+
+    brains = load_brains()
+
+    if not brains: return
+
+    model_s, model_t, elo, units, feats = brains
+
+    db_teams = units['Team'].dropna().unique().tolist()
+
+    matchups = get_live_odds()
+
+    
+
+    db_records = []
+
+    
+
+    print(f"Processing {len(matchups)} upcoming games...")
+
+    print("\n" + "="*175)
+
+    print(f"{'MATCHUP':<12} | {'SCORE':<9} | {'XGB':<8} | {'SIM':<8} | {'CON':<8} | {'VEGAS':<7} | {'PICK':<25} | {'EDGE':<6} | {'CONF':<6} | {'TOT':<10} | {'ANALYSIS'}")
+
+    print("="*175)
+
+    
+
+    for m in matchups:
+
+        h_name, a_name = match_team(m['home'], db_teams), match_team(m['away'], db_teams)
+
+        if not h_name or not a_name: continue
+
+            
+
+        h_u, a_u = units[units['Team'] == h_name].iloc[0], units[units['Team'] == a_name].iloc[0]
+
+        
+
+        row = pd.DataFrame([{
+
+            'elo_diff': elo.get(h_name, 1500) - elo.get(a_name, 1500), 
+
+            'home_elo': elo.get(h_name, 1500), 
+
+            'away_elo': elo.get(a_name, 1500), 
+
+            'efg_mismatch': h_u['eFG'] - a_u['eFG'],
+
+            '3p_mismatch': h_u['3P_pct'] - a_u['3P_pct'], 
+
+            'tov_mismatch': a_u['TOV_pct'] - h_u['TOV_pct'], 
+
+            'orb_mismatch': h_u['ORB_rate'] - a_u['ORB_rate'],
+
+            
+
+            # --- THE MISSING RECENT MOMENTUM MATCHUPS ---
+
+            'recent_efg_mismatch': h_u['recent_eFG'] - a_u['recent_eFG'],
+
+            'recent_3p_mismatch': h_u['recent_3P_pct'] - a_u['recent_3P_pct'],
+
+            'recent_tov_mismatch': a_u['recent_TOV_pct'] - h_u['recent_TOV_pct'],
+
+            'recent_orb_mismatch': h_u['recent_ORB_rate'] - a_u['recent_ORB_rate']
+
+        }])
+
+
+
+        xgb_pred = model_s.predict(row[feats])[0]
+
+        xgb_tot = model_t.predict(row[feats])[0]
+
+        
+
+        pace = max(73.5, ((h_u['Pace'] + a_u['Pace']) / 2) * 1.03)
+
+        
+
+        ortg_diff = (h_u['off_rtg'] + 3.5) - a_u['off_rtg'] 
+
+        adj_factor = ((row['efg_mismatch'].values[0] / 100) * 120) + \
+
+                     ((row['tov_mismatch'].values[0] / 100) * 80) + \
+
+                     ((row['orb_mismatch'].values[0] / 100) * 60)
+
+        proj_margin_base = (ortg_diff + adj_factor) * (pace / 100)
+
+        proj_total_base = ((h_u['Tm_Pts'] + a_u['Tm_Pts']) / 2) * 1.025
+
+        
+
+        volatility = 10.5 * (pace / 71.0)
+
+        sim_margin = run_monte_carlo((proj_total_base + proj_margin_base)/2, (proj_total_base - proj_margin_base)/2, volatility, volatility)
+
+
+
+        con_spr = (xgb_pred * 0.50) + (sim_margin * 0.50)
+
+        con_tot = (xgb_tot * 0.70) + (proj_total_base * 0.30) + 9.0
+
+        
+
+        raw_edge = abs(con_spr - (m['spread'] * -1))
+
+        if raw_edge > 10.0:
+
+            con_spr = con_spr * 0.80
+
+
+
+        if pace > 74.5: con_tot += random.uniform(2.0, 4.0)
+
+        if abs(con_spr) <= 6.0: con_tot += random.uniform(5.5, 7.5)
+
+
+
+        h_score, a_score = int(abs((con_tot + con_spr)/2)), int(abs((con_tot - con_spr)/2))
+
+        
+
+        if h_score == a_score:
+
+            if con_spr > 0: h_score += 1
+
+            else: a_score += 1
+
+
+
+        edge = abs(con_spr - (m['spread'] * -1))
+
+        
+
+        game_date_str = m['start_time'].strftime("%Y-%m-%d")
+
+        game_id = f"{game_date_str}_NCAAB_{m['away']}_{m['home']}".replace(" ", "").replace(".","")
+
+
+
+        p_side = f"{m['home']} {m['spread']:+.1f}" if con_spr > (m['spread'] * -1) else f"{m['away']} {-m['spread']:+.1f}"
+
+        pick_total = f"Ov {m['total']}" if con_tot > m['total'] else f"Un {m['total']}"
+
+        analysis = explain_pick(row, h_name, a_name, h_u, a_u)
+
+        
+
+        # --- ELO OVERRIDE LOGIC (Straight Up Winner) ---
+
+        # If the projected spread is under 3.5 points, trust the overall Power Rating (Elo) 
+
+        # to win the game outright, even if the math leans slightly toward the underdog.
+
+        if abs(con_spr) < 3.5:
+
+            predicted_winner = m['home'] if row['elo_diff'].values[0] > 0 else m['away']
+
+        else:
+
+            predicted_winner = m['home'] if h_score > a_score else m['away']
+
+
+
+        if edge > 5.5: conf = 'high'
+
+        elif edge > 2.5: conf = 'medium'
+
+        else: conf = 'low'
+
+        
+
+        if con_spr >= 0:
+
+            consensus_spread_str = f"{m['home']} -{con_spr:.1f}"
+
+        else:
+
+            consensus_spread_str = f"{m['away']} {con_spr:.1f}"
+
+
+
+        print(f"{m['away'][:3].upper()} @ {m['home'][:3].upper():<4} | {a_score:>3}-{h_score:<3} | {-xgb_pred:+.1f}   | {-sim_margin:+.1f}   | {-con_spr:+.1f}   | {m['spread']:<7.1f} | {p_side:<25} | {edge:<6.1f} | {conf.upper():<6} | {pick_total:<10} | {analysis}")
+
+
+
+        db_records.append((
+
+            game_id, "NCAAB", 4, m['start_time'], m['home'], m['away'], None, None, 
+
+            predicted_winner, pick_total, p_side, 
+
+            consensus_spread_str, 
+
+            str(m['spread']), str(m['total']), conf
+
+        ))
+
+
+
+    if db_records:
+
+        save_to_db(db_records)
+
+
+
+    update_final_scores()
+
+
+
+if __name__ == "__main__":
+
+    run_consensus()
